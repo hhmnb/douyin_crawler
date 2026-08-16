@@ -1,0 +1,9 @@
+﻿douyin_cookies.txt
+*.txt
+venv/
+.idea/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+Thumbs.db
