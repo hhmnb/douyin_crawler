@@ -1,9 +1,20 @@
-﻿douyin_cookies.txt
-*.txt
+# 敏感 / 本地文件
+douyin_cookies.txt
+douyin_browser_data/
+download_history.json
+downloaded_assets/
+
+# Python
 venv/
-.idea/
+.venv/
 __pycache__/
 *.pyc
-*.log
+
+# IDE
+.idea/
+.vscode/
+
+# 系统
 .DS_Store
 Thumbs.db
+*.log
