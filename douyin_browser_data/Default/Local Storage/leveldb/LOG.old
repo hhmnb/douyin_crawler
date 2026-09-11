@@ -1,0 +1,8 @@
+2026/09/11-09:36:53.924 5df0 Reusing MANIFEST C:\Users\17325\Desktop\douyin_crawler\douyin_browser_data\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/11-09:36:53.924 5df0 Recovering log #14
+2026/09/11-09:36:53.924 5df0 Level-0 table #17: started
+2026/09/11-09:36:53.927 5df0 Level-0 table #17: 42816 bytes OK
+2026/09/11-09:36:53.927 5df0 Recovering log #17
+2026/09/11-09:36:53.928 5df0 Reusing old log C:\Users\17325\Desktop\douyin_crawler\douyin_browser_data\Default\Local Storage\leveldb/000017.log 
+2026/09/11-09:36:53.929 5df0 Delete type=0 #14
+2026/09/11-09:36:53.929 5df0 Delete type=2 #18
