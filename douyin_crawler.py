@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import urllib.parse
+import tempfile
 from pathlib import Path
 from datetime import datetime
 import threading
@@ -30,8 +31,12 @@ except ImportError:
 USE_HEADLESS = True
 MAX_RETRY = 3
 DOWNLOAD_THREADS = 16
-AUDIO_WAIT_AFTER_VIDEO = 4.0
+AUDIO_WAIT_AFTER_VIDEO = 6.0
 BATCH_CONCURRENCY = 2
+# 探测阶段最多探测多少个候选，避免长视频浪费流量
+MAX_PROBE_CANDIDATES = 4
+# 头部探测时下载多少字节用于 ffprobe 判断流类型（3MB 足够覆盖 moov atom）
+PROBE_HEAD_BYTES = 3 * 1024 * 1024
 
 URL_BLACKLIST = [
     "uuu_265.mp4", "/obj/douyin-pc-web/uuu_", "ies/douyin_web/media/",
@@ -51,6 +56,11 @@ HISTORY_FILE = "download_history.json"
 
 MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+
+# DASH 音频 URL 特征
+DASH_AUDIO_STRONG = ["mime_type=audio", "audio_mp4", "media-audio", "audio-und"]
+DASH_AUDIO_WEAK = ["-audio-", ".m4a", ".mp3", ".aac", ".opus", "/audio/"]
+BGM_DOMAINS = ["douyinstatic.com", "ies-music"]
 
 
 # ==================== 1. 输出重定向 ====================
@@ -123,6 +133,11 @@ def is_blacklisted(url):
     return any(bad.lower() in lower for bad in URL_BLACKLIST)
 
 
+def is_bgm_url(url):
+    lower = url.lower()
+    return any(d in lower for d in BGM_DOMAINS)
+
+
 def clean_url(url_str):
     try:
         if '\\u' in url_str:
@@ -155,7 +170,7 @@ def append_history(entry):
         print(f"⚠️ 写历史失败: {e}")
 
 
-# ==================== 3. 无Cookie分享页提取（保留作为快速路径） ====================
+# ==================== 3. 无Cookie分享页提取 ====================
 def _search_uri_in_json(obj):
     if isinstance(obj, dict):
         uri = obj.get("uri")
@@ -204,17 +219,15 @@ def _extract_audio_from_html(html):
 
 
 def fetch_video_via_share_page(video_id):
-    """方案1：分享页 + aweme.snssdk.com 直连"""
+    """方案1：分享页 + aweme.snssdk.com 直连。分享页取到的音频是 BGM。"""
     print("📱 【无Cookie】分享页解析...")
     share_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
     headers = {'User-Agent': MOBILE_UA}
     try:
         resp = requests.get(share_url, headers=headers, timeout=15)
         html = resp.text
-
         audio_url = _extract_audio_from_html(html)
 
-        # 提取 uri
         uri = None
         m = re.search(r'"uri"\s*:\s*"(v0[0-9a-f]+)"', html)
         if m:
@@ -240,7 +253,8 @@ def fetch_video_via_share_page(video_id):
             if aweme_url:
                 return {
                     "video_candidates": [aweme_url],
-                    "audio_candidates": [audio_url] if audio_url else [],
+                    "original_audio_candidates": [],
+                    "bgm_candidates": [audio_url] if audio_url else [],
                     "source": "share_page"
                 }
     except Exception as e:
@@ -259,8 +273,30 @@ def parse_universal_data(html_text):
     return None
 
 
+def _extract_original_audio_from_bitrate(video_obj):
+    if not isinstance(video_obj, dict):
+        return None
+    bit_rates = video_obj.get("bit_rate")
+    if not isinstance(bit_rates, list):
+        return None
+    for br in bit_rates:
+        if not isinstance(br, dict):
+            continue
+        play_addr = br.get("play_addr")
+        if not isinstance(play_addr, dict):
+            continue
+        urls = play_addr.get("url_list")
+        if not urls or not isinstance(urls, list):
+            continue
+        for u in urls:
+            u_lower = u.lower()
+            if any(k in u_lower for k in DASH_AUDIO_STRONG):
+                return clean_url(u)
+    return None
+
+
 def extract_media_from_json(data):
-    result = {"video_url": None, "audio_url": None, "images": []}
+    result = {"video_url": None, "audio_url": None, "original_audio_url": None, "images": []}
 
     def _search(obj):
         if isinstance(obj, dict):
@@ -273,6 +309,10 @@ def extract_media_from_json(data):
                         result["video_url"] = clean_url(urls[0])
                 elif isinstance(pa, list) and pa:
                     result["video_url"] = clean_url(pa[0])
+                if not result["original_audio_url"]:
+                    orig = _extract_original_audio_from_bitrate(video)
+                    if orig:
+                        result["original_audio_url"] = orig
             music = obj.get("music") or obj.get("music_info")
             if isinstance(music, dict):
                 pu = music.get("play_url") or music.get("play_info")
@@ -440,7 +480,7 @@ def download_with_ytdlp(video_id, output_path, cookies_file=None):
         return False
 
 
-# ==================== 7. 浏览器自动化（主力方案） ====================
+# ==================== 7. 浏览器自动化 ====================
 def fetch_video_via_browser(video_id):
     if not HAS_PLAYWRIGHT:
         print("❌ 未安装 Playwright")
@@ -452,7 +492,8 @@ def fetch_video_via_browser(video_id):
     api_videos = []
     api_audios = []
     network_candidates = []
-    audio_candidates = []
+    orig_audio_candidates = []
+    bgm_candidates = []
     media_playlist = []
 
     print("🌐 启动浏览器...")
@@ -481,11 +522,15 @@ def fetch_video_via_browser(video_id):
                     try:
                         data = response.json()
                         info = extract_media_from_json(data)
-                        v, a = info.get("video_url"), info.get("audio_url")
+                        v = info.get("video_url")
+                        a = info.get("audio_url")
+                        oa = info.get("original_audio_url")
                         if v:
                             api_videos.append((v, a))
                         if a and a not in api_audios:
                             api_audios.append(a)
+                        if oa and oa not in orig_audio_candidates:
+                            orig_audio_candidates.append(oa)
                     except Exception:
                         pass
                 return
@@ -499,24 +544,30 @@ def fetch_video_via_browser(video_id):
             ]):
                 return
 
+            strong_audio = any(k in lower_url for k in DASH_AUDIO_STRONG)
+            weak_audio = any(k in lower_url for k in DASH_AUDIO_WEAK)
+            url_is_video = any(k in lower_url for k in [
+                "/video/", "media-video", "-video-", ".mp4", ".m4s",
+                "avc1", "hvc1", "hevc",
+            ])
+            url_is_douyinvod = "douyinvod.com" in lower_url
+
             type_label = None
             if "mpegurl" in content_type or "dash+xml" in content_type:
                 type_label = "playlist"
-            elif "audio" in content_type:
+            elif strong_audio:
+                type_label = "audio"
+            elif "audio" in content_type and "video" not in content_type:
+                type_label = "audio"
+            elif url_is_douyinvod and weak_audio:
                 type_label = "audio"
             elif "video" in content_type:
                 type_label = "video"
-            elif any(k in lower_url for k in [
-                "/audio/", "media-audio", "audio-und", "mp4a",
-                "-audio-", ".m4a", ".mp3", ".aac", ".opus",
-                "music", "song", "sound"
-            ]):
+            elif weak_audio:
                 type_label = "audio"
-            elif any(k in lower_url for k in [
-                "/video/", "media-video", "-video-", ".mp4", ".m4s", "avc1", "hvc1", "hevc"
-            ]):
+            elif url_is_video:
                 type_label = "video"
-            elif "douyinvod.com" in lower_url:
+            elif url_is_douyinvod:
                 type_label = "video"
             else:
                 return
@@ -527,7 +578,10 @@ def fetch_video_via_browser(video_id):
             if type_label == "playlist":
                 media_playlist.append(url)
             elif type_label == "audio":
-                audio_candidates.append((size, url))
+                if is_bgm_url(url):
+                    bgm_candidates.append((size, url))
+                else:
+                    orig_audio_candidates.append((size, url))
             else:
                 network_candidates.append((size, url, type_label))
 
@@ -590,7 +644,7 @@ def fetch_video_via_browser(video_id):
             if first_pick_at:
                 ws = time.time()
                 while time.time() - ws < AUDIO_WAIT_AFTER_VIDEO:
-                    if api_audios or audio_candidates:
+                    if orig_audio_candidates or bgm_candidates:
                         print("✅ 已捕获音频，提前结束等待")
                         break
                     time.sleep(0.5)
@@ -620,16 +674,42 @@ def fetch_video_via_browser(video_id):
             for s, u, k in sorted_net:
                 add_v(u)
 
-            audio_list = []
+            orig_list = []
             aseen = set()
-            for u in api_audios:
-                if u not in aseen:
+            for u in orig_audio_candidates:
+                if isinstance(u, tuple):
+                    u = u[1]
+                if u and u not in aseen and not is_bgm_url(u):
                     aseen.add(u)
-                    audio_list.append(u)
-            for s, u in sorted(audio_candidates, key=lambda x: -x[0]):
-                if u not in aseen:
+                    orig_list.append(u)
+
+            api_bgm = []
+            for a in api_audios:
+                if is_bgm_url(a):
+                    api_bgm.append(a)
+                elif a not in aseen:
+                    aseen.add(a)
+                    orig_list.append(a)
+
+            bgm_list = []
+            bseen = set()
+            for u in api_bgm:
+                if u not in bseen:
+                    bseen.add(u)
+                    bgm_list.append(u)
+
+            orig_sorted = sorted([c for c in orig_audio_candidates if isinstance(c, tuple)],
+                                 key=lambda x: -x[0])
+            for s, u in orig_sorted:
+                if u not in aseen and not is_bgm_url(u):
                     aseen.add(u)
-                    audio_list.append(u)
+                    orig_list.append(u)
+
+            bgm_sorted = sorted(bgm_candidates, key=lambda x: -x[0])
+            for s, u in bgm_sorted:
+                if u not in bseen:
+                    bseen.add(u)
+                    bgm_list.append(u)
 
             if not video_list:
                 try:
@@ -641,15 +721,17 @@ def fetch_video_via_browser(video_id):
                 except:
                     pass
 
-            print(f"⏳ 视频候选: {len(video_list)} 个，音频候选: {len(audio_list)} 个")
+            print(f"⏳ 视频候选: {len(video_list)} 个，原声音频候选: {len(orig_list)} 个，BGM候选: {len(bgm_list)} 个")
             for v in video_list[:5]:
                 print(f"   📹 {v[:100]}...")
-            for a in audio_list[:3]:
-                print(f"   🎵 {a[:100]}...")
+            for a in orig_list[:3]:
+                print(f"   🎵[原声] {a[:100]}...")
+            for a in bgm_list[:2]:
+                print(f"   🎵[BGM] {a[:100]}...")
 
         except Exception as e:
             print(f"⚠️ 页面异常: {e}")
-            video_list, audio_list = [], []
+            video_list, orig_list, bgm_list = [], [], []
         finally:
             context.close()
             if browser:
@@ -657,7 +739,10 @@ def fetch_video_via_browser(video_id):
 
     if not video_list:
         return None
-    return {"video_candidates": video_list, "audio_candidates": audio_list, "source": "browser"}
+    return {"video_candidates": video_list,
+            "original_audio_candidates": orig_list,
+            "bgm_candidates": bgm_list,
+            "source": "browser"}
 
 
 # ==================== 8. 视频 ID 提取 ====================
@@ -679,15 +764,6 @@ def get_video_id(input_url):
 
 # ==================== 9. 提取链 ====================
 def fetch_media(video_id):
-    """
-    提取链（优先级从高到低）：
-    1. 分享页 + aweme.snssdk.com 直连（快，但经常失效）
-    2. 分享页 JSON 解析（快，但经常失效）
-    3. yt-dlp（有 cookies 时）
-    4. 浏览器自动化（慢，但最稳）
-    """
-
-    # 方案1：无 cookie 直连
     print("\n📱 方案1：分享页无Cookie直连...")
     result = fetch_video_via_share_page(video_id)
     if result and result.get("video_candidates"):
@@ -695,19 +771,24 @@ def fetch_media(video_id):
         return result
     print("❌ 方案1 失败")
 
-    # 方案2：分享页 JSON 解析
     print("\n📄 方案2：分享页 JSON 解析...")
     res = fetch_video_via_requests(video_id)
     if res and res.get("video_url"):
         print("✅ 方案2 成功！")
+        bgm = []
+        orig = []
+        if res.get("original_audio_url"):
+            orig.append(res.get("original_audio_url"))
+        if res.get("audio_url"):
+            bgm.append(res.get("audio_url"))
         return {
             "video_candidates": [res.get("video_url")],
-            "audio_candidates": [res.get("audio_url")] if res.get("audio_url") else [],
+            "original_audio_candidates": orig,
+            "bgm_candidates": bgm,
             "source": "share_json"
         }
     print("❌ 方案2 失败")
 
-    # 方案3：yt-dlp
     cookie_file = os.path.join(os.getcwd(), "douyin_cookies.txt")
     if HAS_YTDLP and os.path.exists(cookie_file):
         print("\n🚀 方案3：yt-dlp 提取（使用 cookies）...")
@@ -716,14 +797,14 @@ def fetch_media(video_id):
             print("✅ 方案3 成功！")
             return {
                 "video_candidates": [yt.get("video_url")],
-                "audio_candidates": [yt.get("audio_url")] if yt.get("audio_url") else [],
+                "original_audio_candidates": [yt.get("audio_url")] if yt.get("audio_url") else [],
+                "bgm_candidates": [],
                 "source": "yt-dlp"
             }
         print("❌ 方案3 失败（yt-dlp 签名墙）")
     else:
         print("\nℹ️ 方案3 跳过（无 yt-dlp 或无 cookies）")
 
-    # 方案4：浏览器
     print("\n🌐 方案4：浏览器自动化（最后兜底）...")
     browser_res = fetch_video_via_browser(video_id)
     if browser_res and browser_res.get("video_candidates"):
@@ -903,17 +984,84 @@ def check_ffmpeg_available():
     return False
 
 
-def has_audio_stream(file_path):
+def probe_media_info(file_path):
+    """探测媒体流信息。返回 {'has_video': bool, 'has_audio': bool} 或 None"""
     if not check_ffmpeg_available():
-        return False
+        return None
     try:
         r = subprocess.run([
-            "ffprobe", "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(file_path)
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=codec_type",
+            "-of", "json", str(file_path)
         ], capture_output=True, text=True, check=True, timeout=15)
-        return "audio" in r.stdout.lower()
-    except:
-        return False
+        try:
+            data = json.loads(r.stdout)
+        except Exception:
+            return None
+        streams = data.get("streams", [])
+        has_v = any(s.get("codec_type") == "video" for s in streams)
+        has_a = any(s.get("codec_type") == "audio" for s in streams)
+        return {"has_video": has_v, "has_audio": has_a}
+    except FileNotFoundError:
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-i", str(file_path)],
+                capture_output=True, text=True, timeout=15
+            )
+            stderr = r.stderr
+            return {"has_video": "Video:" in stderr,
+                    "has_audio": "Audio:" in stderr}
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def probe_remote_streams(url, headers, probe_bytes=PROBE_HEAD_BYTES):
+    """
+    只下载 URL 的前 probe_bytes 字节，用 ffprobe 探测流类型。
+    返回 {'has_video': bool, 'has_audio': bool} 或 None。
+    长视频秒级探测，避免全量下载后再判断。
+    """
+    if not check_ffmpeg_available():
+        return None
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix='.head.mp4')
+        os.close(fd)
+        h = headers.copy()
+        h['Range'] = f'bytes=0-{probe_bytes - 1}'
+        with requests.get(url, headers=h, stream=True, timeout=15) as r:
+            if r.status_code not in (200, 206):
+                return None
+            if r.status_code == 200:
+                print("   ⚠️ CDN 忽略 Range，可能读取超过探测量的数据")
+            with open(tmp, 'wb') as f:
+                downloaded = 0
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= probe_bytes:
+                        break
+        if os.path.getsize(tmp) < 8 * 1024:
+            return None
+        return probe_media_info(tmp)
+    except Exception as e:
+        print(f"   ⚠️ 头部探测失败: {e}")
+        return None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except:
+                pass
+
+
+def has_audio_stream(file_path):
+    info = probe_media_info(file_path)
+    return bool(info and info.get("has_audio"))
 
 
 def merge_audio_video(video_path, audio_path, output_path):
@@ -923,72 +1071,242 @@ def merge_audio_video(video_path, audio_path, output_path):
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
-            "-c:v", "copy", "-c:a", "aac",
-            "-map", "0:v:0", "-map", "1:a:0", str(output_path)
+            "-c:v", "copy", "-c:a", "copy",
+            "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_path)
         ], check=True, capture_output=True, text=True, timeout=180)
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"❌ 合并失败: {e.stderr[:500]}")
+    except subprocess.CalledProcessError:
+        print("⚠️ -c:a copy 合并失败，尝试 AAC 重编码...")
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_path)
+            ], check=True, capture_output=True, text=True, timeout=180)
+            return True
+        except subprocess.CalledProcessError as e2:
+            print(f"❌ 合并失败: {e2.stderr[:500]}")
+            return False
+    except Exception as e:
+        print(f"❌ 合并异常: {e}")
         return False
 
 
-def download_video_multi_candidates(video_candidates, audio_candidates, headers, output_path):
+def extract_audio_track(video_path, audio_output_path):
+    """从带音轨的视频中抽取音频到 m4a"""
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(video_path), "-vn",
+            "-c:a", "copy", str(audio_output_path)
+        ], check=True, capture_output=True, text=True, timeout=180)
+        return os.path.exists(audio_output_path) and os.path.getsize(audio_output_path) > 1024
+    except subprocess.CalledProcessError:
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(video_path), "-vn",
+                "-c:a", "aac", "-b:a", "192k", str(audio_output_path)
+            ], check=True, capture_output=True, text=True, timeout=180)
+            return os.path.exists(audio_output_path) and os.path.getsize(audio_output_path) > 1024
+        except Exception as e:
+            print(f"⚠️ 抽取音频失败: {e}")
+            return False
+    except Exception as e:
+        print(f"⚠️ 抽取音频异常: {e}")
+        return False
+
+
+def _try_merge_and_replace(video_path, audio_path, label=""):
+    """尝试把 audio_path 合并到 video_path 上，成功则原地替换 video_path。"""
+    tmp_merged = video_path.with_name(video_path.stem + "_merged_tmp.mp4")
+    if merge_audio_video(video_path, audio_path, tmp_merged):
+        try:
+            os.replace(tmp_merged, video_path)
+        except Exception as e:
+            print(f"⚠️ 替换失败: {e}")
+            try:
+                os.remove(tmp_merged)
+            except:
+                pass
+            return False
+        print(f"✅ 已合并{label}音频")
+        return True
+    if os.path.exists(tmp_merged):
+        try:
+            os.remove(tmp_merged)
+        except:
+            pass
+    return False
+
+
+def download_video_multi_candidates(video_candidates, orig_audio_candidates,
+                                     bgm_candidates, headers, output_path):
+    """
+    候选探测式下载（头部探测版）：
+    1. 对每个候选 URL 先 Range 下载头部 PROBE_HEAD_BYTES 字节，ffprobe 判定流类型：
+       - video+audio → 命中，全量下载此候选作为最终视频
+       - video only → 只记 URL，暂不全量下载（等确认无 mixed 流再回头下）
+       - audio only → 全量下载保存为音频源
+       最多探测 MAX_PROBE_CANDIDATES 个候选
+    2. 找不到 mixed 流时，回头全量下载第一个纯视频 URL 作为无声基准
+    3. 找音频优先级：探测得到的原声 > orig_audio_candidates > 探测得到的BGM > bgm_candidates
+    4. 所有探测产生的临时文件通过 finally 统一清理，异常也不会残留
+    """
     if not video_candidates:
         return False
-    for idx, vu in enumerate(video_candidates, 1):
-        print(f"\n📥 视频候选 [{idx}/{len(video_candidates)}]: {vu[:90]}...")
-        if ".m3u8" in vu.lower() or ".mpd" in vu.lower():
-            ok = download_with_ffmpeg(vu, output_path)
-        else:
-            ok = mt_download_file(vu, headers, output_path, num_threads=DOWNLOAD_THREADS)
 
-        if not ok:
-            print(f"⚠️ 候选 {idx} 失败，尝试下一个...")
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except:
-                    pass
-            continue
+    mixed_path = None
+    video_only_url = None        # 纯视频候选 URL（不全量下载，只记 URL）
+    audio_only_sources = []      # [(path, url, is_bgm)]
+    all_probe_files = []
 
-        if has_audio_stream(output_path):
-            print("✅ 视频自带音轨！")
-            return True
+    seen_cand = set()
+    ordered_cands = []
+    for u in video_candidates:
+        if u and u not in seen_cand:
+            seen_cand.add(u)
+            ordered_cands.append(u)
 
-        print("⚠️ 无音轨，下载独立音频...")
-        if not audio_candidates:
-            print("⚠️ 无音频候选")
-            return True
+    try:
+        # ====== 阶段1：头部探测每个候选 ======
+        probed = 0
+        for idx, u in enumerate(ordered_cands, 1):
+            if mixed_path:
+                break
+            if probed >= MAX_PROBE_CANDIDATES:
+                print(f"⚠️ 已探测 {probed} 个候选，达到上限 {MAX_PROBE_CANDIDATES}，停止探测")
+                break
+            probed += 1
 
-        for ai, au in enumerate(audio_candidates, 1):
-            print(f"🎵 音频 [{ai}/{len(audio_candidates)}]: {au[:90]}...")
-            at = output_path.with_suffix('.audio_tmp.m4a')
-            if mt_download_file(au, headers, at, num_threads=8):
-                final = output_path.with_name(output_path.stem + "_merged.mp4")
-                if merge_audio_video(output_path, at, final):
-                    os.replace(final, output_path)
-                    print("✅ 已合并音频！")
-                    try:
-                        os.remove(at)
-                    except:
-                        pass
-                    return True
+            print(f"\n🔎 头部探测 [{idx}/{len(ordered_cands)}]: {u[:90]}...")
+            info = probe_remote_streams(u, headers)
+            if not info:
+                print(f"⚠️ 候选 {idx} 探测失败，跳过")
+                continue
+
+            has_v, has_a = info["has_video"], info["has_audio"]
+            print(f"   → 视频流: {has_v}, 音频流: {has_a}")
+
+            if has_v and has_a:
+                # 命中 mixed 流：全量下载
+                print(f"✅ 候选 {idx} 自带音轨，全量下载...")
+                tmp = output_path.with_name(output_path.stem + f'.probe{idx}.mp4')
+                all_probe_files.append(tmp)
+                if ".m3u8" in u.lower() or ".mpd" in u.lower():
+                    ok = download_with_ffmpeg(u, tmp)
                 else:
-                    try:
-                        os.remove(at)
-                    except:
-                        pass
+                    ok = mt_download_file(u, headers, tmp, num_threads=DOWNLOAD_THREADS)
+                if ok and os.path.exists(tmp) and os.path.getsize(tmp) > 10 * 1024:
+                    mixed_path = tmp
+                else:
+                    print(f"⚠️ 候选 {idx} 全量下载失败")
+                break
+
+            elif has_v and not has_a:
+                if video_only_url is None:
+                    video_only_url = u
+                    print(f"   纯视频流，暂存 URL（稍后如无 mixed 再全量下载）")
+
+            elif has_a and not has_v:
+                # 纯音频流：全量下载，作为音频源
+                print(f"   纯音频流，全量下载...")
+                tmp = output_path.with_name(output_path.stem + f'.probe{idx}.m4a')
+                all_probe_files.append(tmp)
+                if mt_download_file(u, headers, tmp, num_threads=8):
+                    is_bgm = is_bgm_url(u)
+                    audio_only_sources.append((tmp, u, is_bgm))
+                    print(f"   已保存为{'BGM' if is_bgm else '原声'}音频源")
+                else:
+                    print(f"⚠️ 候选 {idx} 音频下载失败")
+
+        # ====== 情况A：找到 mixed 流 ======
+        if mixed_path:
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                os.replace(mixed_path, output_path)
+                mixed_path = None
+            except Exception as e:
+                print(f"❌ 替换失败: {e}")
+                return False
+            return True
+
+        if not video_only_url:
+            print("❌ 未找到可用的视频流")
+            return False
+
+        # ====== 情况B：无 mixed 流，回头全量下载纯视频 ======
+        print(f"\n📥 没有混合流，全量下载纯视频: {video_only_url[:90]}...")
+        tmp_v = output_path.with_name(output_path.stem + '.video_only.mp4')
+        all_probe_files.append(tmp_v)
+        if ".m3u8" in video_only_url.lower() or ".mpd" in video_only_url.lower():
+            ok = download_with_ffmpeg(video_only_url, tmp_v)
+        else:
+            ok = mt_download_file(video_only_url, headers, tmp_v, num_threads=DOWNLOAD_THREADS)
+
+        if not ok or not os.path.exists(tmp_v) or os.path.getsize(tmp_v) < 10 * 1024:
+            print("❌ 纯视频下载失败")
+            return False
+
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            os.replace(tmp_v, output_path)
+        except Exception as e:
+            print(f"❌ 替换失败: {e}")
+            return False
+
+        # 优先级1：探测得到的原声
+        for p, u, is_bgm in audio_only_sources:
+            if not is_bgm:
+                if _try_merge_and_replace(output_path, p, label="原声"):
+                    return True
+
+        # 优先级2：orig_audio_candidates
+        for i, u in enumerate(orig_audio_candidates, 1):
+            print(f"\n🎵 原声音频 [{i}/{len(orig_audio_candidates)}]: {u[:90]}...")
+            at = output_path.with_name(output_path.stem + f'.orig{i}.m4a')
+            if mt_download_file(u, headers, at, num_threads=8):
+                a_info = probe_media_info(at)
+                if a_info and (a_info.get("has_audio") or a_info.get("has_video")):
+                    if _try_merge_and_replace(output_path, at, label="原声"):
+                        try: os.remove(at)
+                        except: pass
+                        return True
+                if os.path.exists(at):
+                    try: os.remove(at)
+                    except: pass
             else:
-                print(f"⚠️ 音频 {ai} 失败")
-            if os.path.exists(at):
+                print(f"⚠️ 原声音频 {i} 下载失败")
+
+        # 优先级3：探测得到的 BGM
+        for p, u, is_bgm in audio_only_sources:
+            if is_bgm:
+                if _try_merge_and_replace(output_path, p, label="BGM"):
+                    return True
+
+        # 优先级4：bgm_candidates
+        for i, u in enumerate(bgm_candidates, 1):
+            print(f"\n🎵 BGM 候选 [{i}/{len(bgm_candidates)}]: {u[:90]}...")
+            at = output_path.with_name(output_path.stem + f'.bgm{i}.m4a')
+            if mt_download_file(u, headers, at, num_threads=8):
+                if _try_merge_and_replace(output_path, at, label="BGM"):
+                    try: os.remove(at)
+                    except: pass
+                    return True
+                if os.path.exists(at):
+                    try: os.remove(at)
+                    except: pass
+
+        print("⚠️ 所有音频候选尝试完毕，保留无声视频")
+        return True
+
+    finally:
+        for p in all_probe_files:
+            if os.path.exists(p):
                 try:
-                    os.remove(at)
+                    os.remove(p)
                 except:
                     pass
-        print("⚠️ 所有音频候选失败")
-        return True
-    print("❌ 所有视频候选均失败")
-    return False
 
 
 # ==================== 11. 音频分离 ====================
@@ -996,7 +1314,7 @@ def extract_audio_from_video(video_path, audio_output_path):
     try:
         subprocess.run([
             "ffmpeg", "-i", str(video_path), "-vn",
-            "-acodec", "libmp3lame", "-q:a", "2",
+            "-c:a", "aac", "-b:a", "192k",
             "-y", str(audio_output_path)
         ], check=True, capture_output=True, text=True, timeout=120)
         print(f"✅ 音频分离: {audio_output_path}")
@@ -1022,7 +1340,6 @@ def process_one_url(target_url, output_dir, get_video, get_audio, extract_audio,
 
     res_data = fetch_media(video_id)
 
-    # 如果提取链全失败，尝试 yt-dlp 直接下载（有 cookies 时）
     if not res_data and HAS_YTDLP:
         cookie_file = os.path.join(os.getcwd(), "douyin_cookies.txt")
         if os.path.exists(cookie_file):
@@ -1031,7 +1348,10 @@ def process_one_url(target_url, output_dir, get_video, get_audio, extract_audio,
             if download_with_ytdlp(video_id, v_path, cookie_file):
                 print(f"{tag} ✨ yt-dlp 成功: {v_path.resolve()}")
                 if extract_audio and check_ffmpeg_available():
-                    extract_audio_from_video(v_path, output_dir / f"extracted_audio_{video_id}_{timestamp}.mp3")
+                    extract_audio_from_video(
+                        v_path,
+                        output_dir / f"extracted_audio_{video_id}_{timestamp}.m4a"
+                    )
                 append_history({
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "video_id": video_id, "file": str(v_path), "method": "yt-dlp"
@@ -1043,19 +1363,32 @@ def process_one_url(target_url, output_dir, get_video, get_audio, extract_audio,
         return False, "解析失败"
 
     video_candidates = list(dict.fromkeys([v for v in res_data.get("video_candidates", []) if v]))
-    audio_candidates = list(dict.fromkeys([a for a in res_data.get("audio_candidates", []) if a]))
+    orig_audios = list(dict.fromkeys([a for a in res_data.get("original_audio_candidates", []) if a]))
+    bgm_audios = list(dict.fromkeys([a for a in res_data.get("bgm_candidates", []) if a]))
+
+    if not orig_audios and not bgm_audios:
+        legacy = list(dict.fromkeys([a for a in res_data.get("audio_candidates", []) if a]))
+        if res_data.get("audio_is_bgm", False):
+            bgm_audios = legacy
+        else:
+            orig_audios = legacy
 
     if get_video and video_candidates:
-        print(f"{tag} 📥 视频候选 {len(video_candidates)} 个，音频候选 {len(audio_candidates)} 个")
+        print(f"{tag} 📥 视频候选 {len(video_candidates)}，原声音频候选 {len(orig_audios)}，BGM 候选 {len(bgm_audios)}")
         v_path = output_dir / f"real_video_{video_id}_{timestamp}.mp4"
         try:
-            ok = download_video_multi_candidates(video_candidates, audio_candidates,
-                                                  download_headers, v_path)
+            ok = download_video_multi_candidates(
+                video_candidates, orig_audios, bgm_audios,
+                download_headers, v_path
+            )
             if ok and v_path.exists() and v_path.stat().st_size > 1024:
                 size_mb = v_path.stat().st_size / 1024 / 1024
                 print(f"{tag} ✨ 视频下载成功: {v_path.resolve()} ({size_mb:.1f} MB)")
                 if extract_audio and check_ffmpeg_available():
-                    extract_audio_from_video(v_path, output_dir / f"extracted_audio_{video_id}_{timestamp}.mp3")
+                    extract_audio_from_video(
+                        v_path,
+                        output_dir / f"extracted_audio_{video_id}_{timestamp}.m4a"
+                    )
                 append_history({
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "video_id": video_id, "file": str(v_path),
@@ -1069,10 +1402,11 @@ def process_one_url(target_url, output_dir, get_video, get_audio, extract_audio,
             print(f"{tag} ❌ 异常: {e}")
             return False, str(e)
 
-    if get_audio and audio_candidates:
+    if get_audio and (orig_audios or bgm_audios):
         print(f"{tag} 📥 仅下载音频...")
-        a_path = output_dir / f"real_bgm_{video_id}_{timestamp}.mp3"
-        if mt_download_file(audio_candidates[0], download_headers, a_path, num_threads=8):
+        candidate = (orig_audios or bgm_audios)[0]
+        a_path = output_dir / f"real_audio_{video_id}_{timestamp}.m4a"
+        if mt_download_file(candidate, download_headers, a_path, num_threads=8):
             return True, str(a_path)
 
     return False, "无候选"
@@ -1162,7 +1496,6 @@ def start_download_thread():
 
     out_dir = output_dir_var.get().strip() or "downloaded_assets"
 
-    # 直接开始下载，不再二次确认
     download_btn.config(state=tk.DISABLED)
     log_box.delete(1.0, tk.END)
 
@@ -1198,7 +1531,7 @@ def on_closing():
 # ==================== 15. 主界面 ====================
 if __name__ == "__main__":
     root = tk.Tk()
-    root.title("短视频批量下载器 v3.1")
+    root.title("短视频批量下载器 v3.4")
     root.geometry("820x740")
     root.minsize(720, 620)
     root.protocol("WM_DELETE_WINDOW", on_closing)
@@ -1213,11 +1546,10 @@ if __name__ == "__main__":
     root.rowconfigure(5, weight=1)
     root.columnconfigure(0, weight=1)
 
-    tk.Label(root, text="短视频批量逆向解析引擎 v3.1",
+    tk.Label(root, text="短视频批量逆向解析引擎 v3.4",
              font=("Helvetica", 15, "bold"), bg=BG_DEEP_BLUE, fg=TEXT_CYAN
              ).grid(row=0, column=0, pady=12, padx=30, sticky="w")
 
-    # 输入框
     input_frame = tk.Frame(root, bg=BG_DEEP_BLUE)
     input_frame.grid(row=1, column=0, sticky="we", padx=30, pady=5)
     input_frame.columnconfigure(1, weight=1)
@@ -1231,7 +1563,6 @@ if __name__ == "__main__":
     url_input.grid(row=0, column=1, sticky="we")
     url_input.focus()
 
-    # 保存目录
     dir_frame = tk.Frame(root, bg=BG_DEEP_BLUE)
     dir_frame.grid(row=2, column=0, sticky="we", padx=30, pady=5)
     dir_frame.columnconfigure(1, weight=1)
@@ -1248,7 +1579,6 @@ if __name__ == "__main__":
               bg=BG_CONTAINER, fg=TEXT_CYAN, relief=tk.FLAT,
               command=show_history).grid(row=0, column=3, padx=(5, 0))
 
-    # 勾选项
     control_frame = tk.Frame(root, bg=BG_DEEP_BLUE)
     control_frame.grid(row=3, column=0, sticky="we", padx=30, pady=8)
 
@@ -1260,7 +1590,7 @@ if __name__ == "__main__":
                    font=("Microsoft YaHei", 10), bg=BG_DEEP_BLUE, fg=TEXT_CYAN,
                    selectcolor=BG_CONTAINER, activebackground=BG_DEEP_BLUE,
                    activeforeground=TEXT_CYAN).grid(row=0, column=0, padx=10, pady=3)
-    tk.Checkbutton(control_frame, text="提取独立 BGM", variable=audio_var,
+    tk.Checkbutton(control_frame, text="提取独立音频（BGM）", variable=audio_var,
                    font=("Microsoft YaHei", 10), bg=BG_DEEP_BLUE, fg=TEXT_CYAN,
                    selectcolor=BG_CONTAINER, activebackground=BG_DEEP_BLUE,
                    activeforeground=TEXT_CYAN).grid(row=0, column=1, padx=10, pady=3)
@@ -1269,7 +1599,6 @@ if __name__ == "__main__":
                    selectcolor=BG_CONTAINER, activebackground=BG_DEEP_BLUE,
                    activeforeground=TEXT_CYAN).grid(row=0, column=2, padx=10, pady=3)
 
-    # 按钮
     btn_container = tk.Frame(root, bg=BG_DEEP_BLUE)
     btn_container.grid(row=4, column=0, sticky="we", pady=(5, 10))
     btn_container.columnconfigure(0, weight=1)
@@ -1281,7 +1610,6 @@ if __name__ == "__main__":
                              relief=tk.FLAT, command=start_download_thread)
     download_btn.grid(row=0, column=0, ipadx=40, ipady=8, padx=30, sticky="we")
 
-    # 日志
     log_frame = tk.Frame(root, bg=BG_DEEP_BLUE)
     log_frame.grid(row=5, column=0, sticky="nsew", padx=30, pady=(5, 20))
     log_frame.rowconfigure(1, weight=1)
